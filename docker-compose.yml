@@ -1,0 +1,22 @@
+version: "3.9"
+
+services:
+  aria:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: aria
+    restart: unless-stopped
+    environment:
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
+      - ARIA_SLACK_WEBHOOK_URL=${ARIA_SLACK_WEBHOOK_URL}
+      - ARIA_PG_PASSWORD=${ARIA_PG_PASSWORD}
+      - ARIA_PG_HOST=${ARIA_PG_HOST:-postgres}
+      - ARIA_PG_DATABASE=${ARIA_PG_DATABASE:-notifications}
+      - ARIA_PG_USER=${ARIA_PG_USER:-notif_user}
+      - ARIA_KAFKA_BOOTSTRAP_SERVERS=${ARIA_KAFKA_BOOTSTRAP_SERVERS:-kafka:9092}
+      - ARIA_KAFKA_ENABLED=${ARIA_KAFKA_ENABLED:-true}
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ./aria/config.yaml:/app/aria/config.yaml:ro
+    network_mode: host
