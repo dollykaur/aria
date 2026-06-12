@@ -1,11 +1,12 @@
 import requests
 import logging
 from aria.models import Diagnosis, Severity
+from aria.notifiers.base import BaseNotifier
 
 logger = logging.getLogger(__name__)
 
 
-class SlackNotifier:
+class SlackNotifier(BaseNotifier):
     def __init__(self, config):
         self.webhook_url = config.webhook_url
 
