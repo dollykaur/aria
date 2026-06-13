@@ -5,6 +5,7 @@ from aria.config import load_config
 from aria.detectors.prometheus import PrometheusDetector
 from aria.agent.loop import investigate
 from aria.notifiers.factory import build_notifier
+from anthropic import AuthenticationError, BadRequestError
 
 logging.basicConfig(
     level=logging.INFO,
@@ -26,15 +27,29 @@ def main():
         try:
             anomalies = detector.check()
             if anomalies:
-                logger.info("Detected %d anomaly(ies) — starting investigation", len(anomalies))
+                print(f"\n{'='*60}")
+                print(f"ARIA detected {len(anomalies)} anomaly(ies) — investigating...")
+                for a in anomalies:
+                    print(f"  • [{a.severity.upper()}] {a.rule_name}")
+                print(f"{'='*60}")
                 diagnosis = investigate(anomalies, config)
                 notifier.post(diagnosis)
-                logger.info("Investigation complete: %s", diagnosis.root_cause)
             else:
                 logger.debug("All clear")
         except KeyboardInterrupt:
             logger.info("ARIA shutting down")
             break
+        except AuthenticationError:
+            logger.error("Invalid Anthropic API key — check ANTHROPIC_API_KEY in your .env file")
+            break
+        except BadRequestError as e:
+            if "credit balance is too low" in str(e):
+                logger.error(
+                    "Your Anthropic account has no credits. "
+                    "Add credits at https://console.anthropic.com/settings/billing and restart ARIA."
+                )
+            else:
+                logger.error("Claude API rejected the request: %s", e)
         except Exception:
             logger.exception("Unexpected error in polling loop — continuing")
 

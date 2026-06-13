@@ -7,12 +7,15 @@ class KafkaTools:
 
     def run(self, group_id: str | None = None) -> ToolResult:
         try:
-            from confluent_kafka.admin import AdminClient
+            from confluent_kafka.admin import AdminClient, ListConsumerGroupsResult
             from confluent_kafka import TopicPartition, Consumer
 
             admin = AdminClient({"bootstrap.servers": self.config.bootstrap_servers})
 
-            groups_result = admin.list_consumer_groups()
+            # list_consumer_groups() returns a Future in newer confluent-kafka versions
+            # call .result() to get the actual ListConsumerGroupsResult object
+            groups_future = admin.list_consumer_groups()
+            groups_result = groups_future.result()
             all_groups = [g.group_id for g in groups_result.valid]
 
             if not all_groups:
@@ -31,7 +34,6 @@ class KafkaTools:
                     lines.append(f"  {gid}: no committed offsets")
                     continue
 
-                # Get high watermarks to compute actual lag
                 consumer = Consumer({
                     "bootstrap.servers": self.config.bootstrap_servers,
                     "group.id": f"aria-lag-check-{gid}",
@@ -55,7 +57,7 @@ class KafkaTools:
 
             summary = f"Total consumer lag across {len(target_groups)} group(s): {total_lag}"
             if total_lag > self.config.consumer_lag_threshold:
-                summary += f" ⚠️ ABOVE THRESHOLD ({self.config.consumer_lag_threshold})"
+                summary += f" WARNING: above threshold ({self.config.consumer_lag_threshold})"
 
             return ToolResult(summary + "\n" + "\n".join(lines))
 

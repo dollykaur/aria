@@ -30,8 +30,6 @@ def investigate(anomalies: list[Anomaly], config) -> Diagnosis:
     final_text = ""
 
     for iteration in range(config.max_tool_iterations):
-        logger.info("Agent iteration %d/%d", iteration + 1, config.max_tool_iterations)
-
         response = client.messages.create(
             model=config.claude_model,
             max_tokens=4096,
@@ -55,9 +53,12 @@ def investigate(anomalies: list[Anomaly], config) -> Diagnosis:
             if block.type != "tool_use":
                 continue
 
-            logger.info("Tool call: %s(%s)", block.name, block.input)
+            print(f"  • {_describe_tool(block.name, block.input)}")
             result = registry.execute(block.name, block.input)
-            logger.info("Tool result (success=%s): %s", result.success, result.content[:200])
+            if not result.success:
+                print(f"    ✗ {result.content.splitlines()[0]}")
+            else:
+                print(f"    ✓ done")
 
             if block.name == "restart_docker_container" and result.success:
                 action_taken = ActionTaken(
@@ -81,6 +82,19 @@ def investigate(anomalies: list[Anomaly], config) -> Diagnosis:
 
     duration = time.monotonic() - start
     return _parse_diagnosis(anomalies, final_text, action_taken, duration)
+
+
+def _describe_tool(name: str, inputs: dict) -> str:
+    if name == "query_prometheus":
+        return f"Checking metrics — {inputs.get('query', '')[:60]}"
+    elif name == "query_pg_slow_queries":
+        return f"Checking PostgreSQL for slow queries (last {inputs.get('since_minutes', 15)} mins)"
+    elif name == "get_kafka_consumer_lag":
+        group = inputs.get("group_id")
+        return f"Checking Kafka consumer lag{f' for {group}' if group else ' across all groups'}"
+    elif name == "restart_docker_container":
+        return f"Restarting container '{inputs.get('container_name')}' — {inputs.get('reason', '')}"
+    return name
 
 
 def _parse_diagnosis(anomalies, text: str, action_taken: ActionTaken, duration: float) -> Diagnosis:
