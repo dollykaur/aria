@@ -2,7 +2,7 @@ import time
 import logging
 import anthropic
 
-from aria.models import Anomaly, Diagnosis, ActionTaken
+from aria.models import Anomaly, CorrelatedIncident, Diagnosis, ActionTaken
 from aria.agent.tools import TOOL_DEFINITIONS
 from aria.agent.system_prompt import build_system_prompt
 from aria.tools.base import ToolRegistry
@@ -12,14 +12,28 @@ from aria.memory.store import save_incident
 logger = logging.getLogger(__name__)
 
 
-def investigate(anomalies: list[Anomaly], config) -> Diagnosis:
+def investigate(incident: CorrelatedIncident, config) -> Diagnosis:
     client = anthropic.Anthropic(api_key=config.anthropic_api_key)
     registry = ToolRegistry(config)
     start = time.monotonic()
+    anomalies = incident.anomalies
 
-    anomaly_text = "\n".join(
-        f"- [{a.severity.upper()}] {a.rule_name}: value={a.value:.4f}, labels={a.labels}"
+    # Build a structured incident brief for Claude
+    services_text = (
+        "\n".join(f"  - {s}" for s in incident.affected_services)
+        if incident.affected_services
+        else "  - (no service label in metrics)"
+    )
+    signals_text = "\n".join(
+        f"  - [{a.severity.upper()}] {a.rule_name}: value={a.value:.4f}, labels={a.labels}"
         for a in anomalies
+    )
+    incident_brief = (
+        f"INCIDENT: {incident.title}\n"
+        f"SEVERITY: {incident.severity.upper()}\n"
+        f"SIGNAL COUNT: {len(anomalies)}\n"
+        f"AFFECTED SERVICES ({len(incident.affected_services)}):\n{services_text}\n\n"
+        f"RAW SIGNALS:\n{signals_text}"
     )
 
     # Check memory for similar past incidents
@@ -30,8 +44,8 @@ def investigate(anomalies: list[Anomaly], config) -> Diagnosis:
         print(f"  • Found {len(similar)} similar past incident(s) in memory — providing context to Claude")
 
     initial_message = (
-        f"The following anomalies were detected at {anomalies[0].detected_at.isoformat()}:\n\n"
-        f"{anomaly_text}\n\n"
+        f"Incident detected at {anomalies[0].detected_at.isoformat()}:\n\n"
+        f"{incident_brief}\n\n"
         f"{memory_context}"
         "Please investigate, identify the root cause, and take one safe remediation action if appropriate."
     )

@@ -3,6 +3,7 @@ import logging
 import sys
 from aria.config import load_config
 from aria.detectors.prometheus import PrometheusDetector
+from aria.correlator import correlate
 from aria.agent.loop import investigate
 from aria.notifiers.factory import build_notifier
 from aria.memory.store import init_db
@@ -29,13 +30,17 @@ def main():
         try:
             anomalies = detector.check()
             if anomalies:
+                incidents = correlate(anomalies)
                 print(f"\n{'='*60}")
-                print(f"ARIA detected {len(anomalies)} anomaly(ies) — investigating...")
-                for a in anomalies:
-                    print(f"  • [{a.severity.upper()}] {a.rule_name}")
+                print(f"ARIA detected {len(incidents)} incident(s) across {len(anomalies)} signal(s)")
+                for inc in incidents:
+                    svc_hint = f" → {len(inc.affected_services)} service(s)" if inc.affected_services else ""
+                    print(f"  • [{inc.severity.upper()}] {inc.title}{svc_hint}")
                 print(f"{'='*60}")
-                diagnosis = investigate(anomalies, config)
-                notifier.post(diagnosis)
+                for inc in incidents:
+                    print(f"\nInvestigating: {inc.title}")
+                    diagnosis = investigate(inc, config)
+                    notifier.post(diagnosis)
             else:
                 logger.debug("All clear")
         except KeyboardInterrupt:
