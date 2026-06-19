@@ -24,20 +24,114 @@ ARIA:            "CPU spiked at 90% because a slow PostgreSQL query
 
 ## How it works
 
+```mermaid
+graph TD
+    A([ARIA starts]) --> B[Poll Prometheus every 30s]
+    B --> C{Anomaly detected?}
+    C -- No --> B
+    C -- Yes --> D[Claude AI Investigation Loop]
+
+    D --> E[Query Prometheus\nfor metric trends]
+    D --> F[Check PostgreSQL\nfor slow queries]
+    D --> G[Check Kafka\nconsumer lag]
+
+    E --> H{Root cause\nidentified?}
+    F --> H
+    G --> H
+
+    H -- No, need more data --> D
+    H -- Yes --> I{Safe action\nwarranted?}
+
+    I -- No --> J[Generate diagnosis]
+    I -- Yes --> K[Restart approved\nDocker container]
+    K --> J
+
+    J --> L{Notifier}
+    L --> M[Slack]
+    L --> N[Email]
+    L --> O[Console]
 ```
-Every 30 seconds
-      ↓
-Poll Prometheus for anomalies (configurable PromQL rules)
-      ↓
-Anomaly detected?
-      ↓
-Claude AI investigates using tools:
-  → Query Prometheus for metric trends
-  → Check PostgreSQL for slow queries
-  → Check Kafka consumer lag
-  → Restart a Docker container (if safe and warranted)
-      ↓
-Plain-English diagnosis posted to Slack / Email / Console
+
+---
+
+## Architecture
+
+```mermaid
+graph LR
+    subgraph Your System
+        P[Prometheus]
+        DB[(PostgreSQL)]
+        K[Kafka]
+        D[Docker]
+    end
+
+    subgraph ARIA
+        DET[Detector]
+        AGT[Claude Agent\nLoop]
+        REG[Tool Registry]
+        NOT[Notifier]
+    end
+
+    subgraph Notifications
+        SL[Slack]
+        EM[Email]
+        CO[Console]
+    end
+
+    P -->|metrics| DET
+    DET -->|anomalies| AGT
+    AGT -->|tool calls| REG
+    REG -->|query| P
+    REG -->|query| DB
+    REG -->|check lag| K
+    REG -->|restart| D
+    REG -->|results| AGT
+    AGT -->|diagnosis| NOT
+    NOT --> SL
+    NOT --> EM
+    NOT --> CO
+```
+
+---
+
+## Sequence Diagram — Investigation Flow
+
+```mermaid
+sequenceDiagram
+    participant P as Prometheus
+    participant ARIA as ARIA Detector
+    participant C as Claude AI
+    participant T as Tool Registry
+    participant DB as PostgreSQL
+    participant K as Kafka
+    participant S as Slack/Email
+
+    loop Every 30 seconds
+        ARIA->>P: Query anomaly rules (PromQL)
+        P-->>ARIA: Threshold breached
+    end
+
+    ARIA->>C: "Anomaly detected — investigate"
+    C->>T: query_prometheus(cpu trend)
+    T->>P: GET /api/v1/query_range
+    P-->>T: metric data
+    T-->>C: CPU spiked at 16:42
+
+    C->>T: query_pg_slow_queries()
+    T->>DB: SELECT from pg_stat_statements
+    DB-->>T: slow query found (4.2s mean)
+    T-->>C: slow query data
+
+    C->>T: get_kafka_consumer_lag()
+    T->>K: check consumer offsets
+    K-->>T: lag = 8500
+    T-->>C: consumer lag data
+
+    C->>T: restart_docker_container("email-worker")
+    T-->>C: restarted successfully
+
+    C-->>ARIA: Root cause + diagnosis
+    ARIA->>S: Post plain-English report
 ```
 
 ---
