@@ -6,6 +6,8 @@ from aria.models import Anomaly, Diagnosis, ActionTaken
 from aria.agent.tools import TOOL_DEFINITIONS
 from aria.agent.system_prompt import build_system_prompt
 from aria.tools.base import ToolRegistry
+from aria.memory.matcher import find_similar_incidents, build_memory_context
+from aria.memory.store import save_incident
 
 logger = logging.getLogger(__name__)
 
@@ -19,9 +21,18 @@ def investigate(anomalies: list[Anomaly], config) -> Diagnosis:
         f"- [{a.severity.upper()}] {a.rule_name}: value={a.value:.4f}, labels={a.labels}"
         for a in anomalies
     )
+
+    # Check memory for similar past incidents
+    similar = find_similar_incidents(anomalies)
+    memory_context = build_memory_context(similar)
+
+    if similar:
+        print(f"  • Found {len(similar)} similar past incident(s) in memory — providing context to Claude")
+
     initial_message = (
         f"The following anomalies were detected at {anomalies[0].detected_at.isoformat()}:\n\n"
         f"{anomaly_text}\n\n"
+        f"{memory_context}"
         "Please investigate, identify the root cause, and take one safe remediation action if appropriate."
     )
 
@@ -81,7 +92,13 @@ def investigate(anomalies: list[Anomaly], config) -> Diagnosis:
         final_text = "Investigation reached maximum iterations without a conclusion."
 
     duration = time.monotonic() - start
-    return _parse_diagnosis(anomalies, final_text, action_taken, duration)
+    diagnosis = _parse_diagnosis(anomalies, final_text, action_taken, duration)
+
+    # Save to memory so future investigations can learn from this one
+    incident_id = save_incident(anomalies, diagnosis)
+    print(f"  • Incident saved to memory (ID: {incident_id})")
+
+    return diagnosis
 
 
 def _describe_tool(name: str, inputs: dict) -> str:

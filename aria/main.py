@@ -5,6 +5,7 @@ from aria.config import load_config
 from aria.detectors.prometheus import PrometheusDetector
 from aria.agent.loop import investigate
 from aria.notifiers.factory import build_notifier
+from aria.memory.store import init_db
 from anthropic import AuthenticationError, BadRequestError
 
 logging.basicConfig(
@@ -17,6 +18,7 @@ logger = logging.getLogger("aria")
 
 def main():
     config = load_config()
+    init_db()
     detector = PrometheusDetector(config.prometheus)
     notifier = build_notifier(config)
 
