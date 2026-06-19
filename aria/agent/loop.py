@@ -37,11 +37,14 @@ def investigate(incident: CorrelatedIncident, config) -> Diagnosis:
     )
 
     # Check memory for similar past incidents
-    similar = find_similar_incidents(anomalies)
+    similar = find_similar_incidents(anomalies)  # list of (score, incident) tuples
     memory_context = build_memory_context(similar)
 
     if similar:
-        print(f"  • Found {len(similar)} similar past incident(s) in memory — providing context to Claude")
+        top_score, _ = similar[0]
+        top_pct = int(top_score * 100)
+        label = "KNOWN PATTERN" if top_pct >= 85 else "partial match"
+        print(f"  • Memory: {len(similar)} similar incident(s) — top similarity {top_pct}% ({label})")
 
     initial_message = (
         f"Incident detected at {anomalies[0].detected_at.isoformat()}:\n\n"

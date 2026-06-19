@@ -5,11 +5,17 @@ from aria.memory.store import get_recent_incidents
 
 logger = logging.getLogger(__name__)
 
+# Above this score Claude gets a structured "known pattern" block and can skip
+# deep investigation. Below it Claude gets hints but must still investigate.
+HIGH_SIMILARITY_THRESHOLD = 0.85
 
-def find_similar_incidents(anomalies: list[Anomaly], threshold: float = 0.5) -> list[dict]:
+
+def find_similar_incidents(
+    anomalies: list[Anomaly], threshold: float = 0.5
+) -> list[tuple[float, dict]]:
     """
     Compare incoming anomalies against past incidents.
-    Returns a list of similar past incidents sorted by similarity score.
+    Returns (score, incident) tuples sorted by score descending.
 
     Scoring:
       +0.5 — same anomaly rule names
@@ -29,78 +35,128 @@ def find_similar_incidents(anomalies: list[Anomaly], threshold: float = 0.5) -> 
     scored = []
     for incident in past_incidents:
         score = 0.0
-
         past_names = set(json.loads(incident["anomaly_names"]))
         past_services = set(json.loads(incident["affected_services"]))
 
-        # Same anomaly types detected
         if incoming_names == past_names:
             score += 0.5
         elif incoming_names & past_names:
-            # Partial overlap — some same anomaly types
             overlap = len(incoming_names & past_names) / len(incoming_names | past_names)
             score += 0.5 * overlap
 
-        # Same services affected
         if incoming_services == past_services:
             score += 0.3
         elif incoming_services & past_services:
             overlap = len(incoming_services & past_services) / len(incoming_services | past_services)
             score += 0.3 * overlap
 
-        # Past incident was resolved
         if incident["resolved"]:
             score += 0.2
 
         if score >= threshold:
             scored.append((score, incident))
 
-    # Sort by score descending — best match first
     scored.sort(key=lambda x: x[0], reverse=True)
-    return [incident for _, incident in scored[:3]]  # return top 3 matches
+    return scored[:3]
 
 
-def build_memory_context(similar_incidents: list[dict]) -> str:
+def build_memory_context(similar: list[tuple[float, dict]]) -> str:
     """
-    Format past incidents into plain English for Claude to read.
-    This gets injected into Claude's investigation context.
+    Build the memory block injected into Claude's investigation prompt.
+
+    High similarity (≥ 85%): structured "known pattern" block — Claude confirms
+    quickly rather than re-investigating from scratch.
+
+    Low-medium similarity (< 85%): free-text hints — Claude uses them as
+    hypotheses but still does a full investigation.
     """
-    if not similar_incidents:
+    if not similar:
         return ""
 
-    lines = [
-        "PAST SIMILAR INCIDENTS (use this context to guide your investigation):\n"
-    ]
+    top_score, top_incident = similar[0]
 
-    for i, incident in enumerate(similar_incidents, 1):
+    if top_score >= HIGH_SIMILARITY_THRESHOLD:
+        return _build_known_pattern_block(top_score, top_incident, len(similar))
+    else:
+        return _build_hint_block(similar)
+
+
+def _build_known_pattern_block(score: float, incident: dict, match_count: int) -> str:
+    """
+    Structured context for high-confidence matches.
+    Tells Claude exactly what happened before so it can confirm fast.
+    """
+    pct = int(score * 100)
+    detected = incident["detected_at"][:16].replace("T", " ")
+    services = json.loads(incident["affected_services"])
+    recommendations = json.loads(incident.get("evidence", "[]"))
+    action = incident["action_taken"]
+    duration = incident["investigation_duration_seconds"]
+
+    recs_text = (
+        "\n".join(f"  - {r}" for r in recommendations[:3])
+        if recommendations
+        else "  - No specific recommendations recorded"
+    )
+
+    lines = [
+        f"KNOWN INCIDENT PATTERN DETECTED (similarity: {pct}%)",
+        "",
+        f"This appears to be a recurrence of a known incident pattern seen {match_count} time(s).",
+        "Review the known facts below, verify they still apply, then respond with your diagnosis.",
+        "",
+        f"KNOWN ROOT CAUSE  : {incident['root_cause']}",
+        f"KNOWN ACTION TAKEN: {action}",
+        f"KNOWN OUTCOME     : {'Resolved' if incident['resolved'] else 'Unresolved'} (investigated in {duration}s)",
+        f"AFFECTED SERVICES : {', '.join(services)}",
+        f"LAST SEEN         : {detected}",
+        f"OCCURRENCES       : {match_count}",
+        "",
+        "KNOWN RECOMMENDATIONS:",
+        recs_text,
+        "",
+        "INSTRUCTIONS:",
+        "- Use query_prometheus to quickly confirm the known root cause still applies.",
+        "- If confirmed: state the root cause, note this is a known recurrence, and apply the known fix if still appropriate.",
+        "- If NOT confirmed: investigate normally and note what differs from the known pattern.",
+        "",
+    ]
+    return "\n".join(lines)
+
+
+def _build_hint_block(similar: list[tuple[float, dict]]) -> str:
+    """
+    Free-text hints for low-medium similarity matches.
+    Claude uses these as starting hypotheses, not confirmed facts.
+    """
+    lines = ["PAST SIMILAR INCIDENTS (treat as hints — investigate fully):\n"]
+
+    for i, (score, incident) in enumerate(similar, 1):
+        pct = int(score * 100)
         detected = incident["detected_at"][:16].replace("T", " ")
         anomaly_names = json.loads(incident["anomaly_names"])
         services = json.loads(incident["affected_services"])
-        action = incident["action_taken"]
-        resolved = "Yes" if incident["resolved"] else "No"
-        duration = incident["investigation_duration_seconds"]
+        recommendations = json.loads(incident.get("evidence", "[]"))
 
-        lines.append(f"Incident #{i} — {detected}")
+        lines.append(f"Incident #{i} — {detected} (similarity: {pct}%)")
         lines.append(f"  Anomalies : {', '.join(anomaly_names)}")
         lines.append(f"  Services  : {', '.join(services)}")
         lines.append(f"  Root cause: {incident['root_cause']}")
-        lines.append(f"  Action    : {action}")
-        lines.append(f"  Resolved  : {resolved} (investigated in {duration}s)")
+        lines.append(f"  Action    : {incident['action_taken']}")
+        lines.append(f"  Resolved  : {'Yes' if incident['resolved'] else 'No'}")
 
         if incident["container_restarted"]:
             lines.append(f"  Restarted : {incident['container_restarted']}")
 
-        recommendations = json.loads(incident.get("evidence", "[]"))
         if recommendations:
-            lines.append(f"  Key findings:")
+            lines.append("  Key findings:")
             for r in recommendations[:2]:
                 lines.append(f"    - {r}")
 
         lines.append("")
 
     lines.append(
-        "If the current anomaly matches a past incident pattern, "
-        "confirm the hypothesis quickly and apply the known fix if still appropriate.\n"
+        "These are partial matches. Investigate fully and use past incidents "
+        "only as starting hypotheses.\n"
     )
-
     return "\n".join(lines)
