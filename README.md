@@ -6,50 +6,58 @@
 
 ## What is ARIA?
 
-ARIA is an autonomous SRE (Site Reliability Engineering) agent. It watches your system's metrics, and when something goes wrong — instead of just firing an alert — it **thinks**.
+ARIA is an autonomous SRE agent. It watches your system's metrics, and when something goes wrong — instead of firing a dumb alert — it **thinks**.
 
-It uses Claude AI to investigate the problem across multiple data sources, figure out the root cause, take one safe remediation action if appropriate, and send you a plain-English report.
+It uses Claude AI to investigate the problem across multiple data sources, identify the root cause, take one safe remediation action if appropriate, and post a plain-English report.
 
 ```
-Normal alert:    "CPU is at 90%" — you wake up, spend 45 mins investigating
+Normal alert:  "CPU is at 90%" — you wake up, spend 45 mins investigating
 
-ARIA:            "CPU spiked at 90% because a slow PostgreSQL query
-                  (4.2s mean) caused the email consumer to stall,
-                  building 8500 messages of Kafka lag and triggering
-                  retries. I restarted the email worker. Add an index
-                  on notifications(status) to prevent recurrence."
+ARIA:          "Fleet-wide GC burst detected across all 4 notification services
+                (4th recurrence in 6 hours — WORSENING, Risk: HIGH).
+                Root cause: scheduled batch dispatch in notification-api driving
+                simultaneous G1 Young Gen evacuation pauses fleet-wide.
+                email-worker accumulating Old Gen pressure (48 GC events, 8.5s
+                cumulative pause — 2.2x peers). Escalate to platform engineer."
 ```
 
 ---
 
-## How it works
+## How It Works
 
 ```mermaid
 graph TD
     A([ARIA starts]) --> B[Poll Prometheus every 30s]
     B --> C{Anomaly detected?}
     C -- No --> B
-    C -- Yes --> D[Claude AI Investigation Loop]
+    C -- Yes --> D[Incident Correlation Engine]
 
-    D --> E[Query Prometheus\nfor metric trends]
-    D --> F[Check PostgreSQL\nfor slow queries]
-    D --> G[Check Kafka\nconsumer lag]
+    D --> E[Group related signals\ninto one incident]
+    E --> F[Check Incident Memory\nfor similar past events]
+    F --> G[Route to relevant tools\nbased on signal type]
+    G --> H[Claude AI Investigation Loop]
 
-    E --> H{Root cause\nidentified?}
-    F --> H
-    G --> H
+    H --> I[Query Prometheus]
+    H --> J[Check PostgreSQL]
+    H --> K[Check Kafka lag]
 
-    H -- No, need more data --> D
-    H -- Yes --> I{Safe action\nwarranted?}
+    I --> L{Root cause\nidentified?}
+    J --> L
+    K --> L
 
-    I -- No --> J[Generate diagnosis]
-    I -- Yes --> K[Restart approved\nDocker container]
-    K --> J
+    L -- Need more data --> H
+    L -- Yes --> M{Safe action\nwarranted?}
 
-    J --> L{Notifier}
-    L --> M[Slack]
-    L --> N[Email]
-    L --> O[Console]
+    M -- No --> N[Generate diagnosis]
+    M -- Yes --> O[Restart approved\nDocker container]
+    O --> N
+
+    N --> P[Update Incident Family\ntrend + risk level]
+    P --> Q[Save to Memory]
+    Q --> R{Notifier}
+    R --> S[Slack]
+    R --> T[Email]
+    R --> U[Console]
 ```
 
 ---
@@ -65,11 +73,19 @@ graph LR
         D[Docker]
     end
 
-    subgraph ARIA
+    subgraph ARIA Core
         DET[Detector]
-        AGT[Claude Agent\nLoop]
+        COR[Correlator]
+        RTR[Router]
+        AGT[Claude Agent Loop]
         REG[Tool Registry]
         NOT[Notifier]
+    end
+
+    subgraph Intelligence Layer
+        MEM[(Incident Memory\nSQLite)]
+        FAM[Family Tracker]
+        SIM[Similarity Engine\n4-dimension Jaccard]
     end
 
     subgraph Notifications
@@ -79,14 +95,18 @@ graph LR
     end
 
     P -->|metrics| DET
-    DET -->|anomalies| AGT
-    AGT -->|tool calls| REG
+    DET -->|anomalies| COR
+    COR -->|correlated incident| RTR
+    RTR -->|investigation path| AGT
+    AGT <-->|tool calls| REG
     REG -->|query| P
     REG -->|query| DB
     REG -->|check lag| K
     REG -->|restart| D
-    REG -->|results| AGT
-    AGT -->|diagnosis| NOT
+    AGT -->|diagnosis| FAM
+    FAM <-->|read/write| MEM
+    SIM <-->|match| MEM
+    AGT -->|report| NOT
     NOT --> SL
     NOT --> EM
     NOT --> CO
@@ -94,66 +114,72 @@ graph LR
 
 ---
 
-## Sequence Diagram — Investigation Flow
+## Intelligence Features
 
-```mermaid
-sequenceDiagram
-    participant P as Prometheus
-    participant ARIA as ARIA Detector
-    participant C as Claude AI
-    participant T as Tool Registry
-    participant DB as PostgreSQL
-    participant K as Kafka
-    participant S as Slack/Email
+### Incident Correlation Engine
+Multiple alerts from the same root cause are grouped into one incident before Claude investigates. Four "High CPU Usage" signals across four services become one **Fleet-wide High CPU Usage** investigation — one Claude call, not four.
 
-    loop Every 30 seconds
-        ARIA->>P: Query anomaly rules (PromQL)
-        P-->>ARIA: Threshold breached
-    end
+### Adaptive Tool Selection
+ARIA classifies each anomaly by signal type and builds a focused investigation path before calling Claude:
 
-    ARIA->>C: "Anomaly detected — investigate"
-    C->>T: query_prometheus(cpu trend)
-    T->>P: GET /api/v1/query_range
-    P-->>T: metric data
-    T-->>C: CPU spiked at 16:42
+| Signal type | Investigates first | Defers |
+|---|---|---|
+| JVM GC spike | GC pause rates, heap usage, Kafka lag | PostgreSQL, host CPU |
+| Host CPU spike | process vs system CPU, JVM GC | Kafka, PostgreSQL |
+| Kafka / DLQ | consumer lag, delivery failure rates | PostgreSQL, host CPU |
+| DB connection pool | slow queries, HikariCP metrics | Kafka, JVM GC |
+| HTTP 5xx errors | error rates, PostgreSQL, Kafka | — |
 
-    C->>T: query_pg_slow_queries()
-    T->>DB: SELECT from pg_stat_statements
-    DB-->>T: slow query found (4.2s mean)
-    T-->>C: slow query data
+### Incident Memory
+Every investigation is stored in SQLite and matched against future incidents using a **4-dimension Jaccard similarity model**:
 
-    C->>T: get_kafka_consumer_lag()
-    T->>K: check consumer offsets
-    K-->>T: lag = 8500
-    T-->>C: consumer lag data
+| Dimension | Weight | What it measures |
+|---|---|---|
+| Anomaly type | 40% | Word-token Jaccard on rule names |
+| Affected services | 25% | Set Jaccard on service names |
+| Metric signals | 20% | Jaccard on raw PromQL metric identifiers |
+| Time of day | 15% | Hour proximity — catches scheduled-job patterns |
 
-    C->>T: restart_docker_container("email-worker")
-    T-->>C: restarted successfully
+At **≥ 85% similarity**, Claude receives a structured "known pattern" block and confirms quickly instead of re-investigating from scratch.
 
-    C-->>ARIA: Root cause + diagnosis
-    ARIA->>S: Post plain-English report
+### Incident Family Tracking
+Related incidents are grouped into families named after their **root cause class**, not the metric:
+
+```
+Incident Family : Notification Batch Dispatch GC
+First Seen      : 2026-06-19 22:59
+Last Seen       : 2026-06-20 05:23
+Occurrences     : 4
+Trend           : WORSENING | +161% metric
+Risk Level      : HIGH
 ```
 
----
+Risk escalates automatically: `warning → elevated → high → critical` when trend is worsening or occurrence count reaches 4+.
 
-## Features
+### Human Feedback Loop
+```bash
+aria-feedback <incident_id> correct
+aria-feedback <incident_id> incorrect "database lock contention, not batch job"
+aria-stats
+```
 
-- **Anomaly detection** — configurable PromQL rules, any metric Prometheus tracks
-- **AI-powered investigation** — Claude reasons across metrics, database, and queue data
-- **Safe autonomous action** — restarts containers from an approved whitelist only
-- **Multi-notifier** — send reports to Slack, Email, or Console
-- **Plug-and-play** — disable Kafka or PostgreSQL via config if your stack doesn't use them
-- **Extensible** — add new tools, anomaly rules, or notifiers without touching core logic
+```
+ARIA Diagnosis Accuracy
+========================================
+Diagnoses reviewed : 12
+  Correct          : 10  (83.3%)
+  Incorrect        : 2
 
----
+Incident Families
+========================================
+  Notification Batch Dispatch GC   4 occurrences  WORSENING  Risk: HIGH
+  Notification Kafka Consumer Lag  2 occurrences  STABLE     Risk: WARNING
+```
 
-## Prerequisites
-
-- Python 3.11+
-- [uv](https://github.com/astral-sh/uv) — Python package manager
-- A running Prometheus instance (port 9090)
-- An [Anthropic API key](https://console.anthropic.com/)
-- Docker (optional — only needed for container restarts)
+### Safety Guardrails
+- **Container whitelist** — ARIA only restarts containers explicitly listed in `config.yaml`. Hard code-level check, Claude cannot bypass it.
+- **No infrastructure tuning** — Claude flags JVM, kernel, and database tuning opportunities but never suggests specific values. Defers to platform engineers.
+- **One action per investigation** — Claude may take at most one remediation action per run.
 
 ---
 
@@ -176,7 +202,7 @@ uv sync
 cp .env.example .env
 ```
 
-Open `.env` and fill in your values:
+Open `.env` and fill in:
 ```
 ANTHROPIC_API_KEY=sk-ant-...
 ARIA_NOTIFIER=console
@@ -188,13 +214,11 @@ ARIA_PG_PASSWORD=your_db_password
 uv run aria
 ```
 
-ARIA will start polling Prometheus every 30 seconds and print any diagnoses to the console.
+ARIA polls Prometheus every 30 seconds and prints diagnoses to the console.
 
 ---
 
 ## Configuration
-
-All settings live in two places:
 
 | File | Purpose |
 |---|---|
@@ -203,25 +227,17 @@ All settings live in two places:
 
 Environment variables always override `config.yaml`.
 
----
-
-### Choosing your notifier
-
-Set `ARIA_NOTIFIER` in your `.env`:
+### Notifier
 
 ```
-ARIA_NOTIFIER=console   # print to terminal (default, good for development)
-ARIA_NOTIFIER=slack     # post to Slack channel
-ARIA_NOTIFIER=email     # send an email
+ARIA_NOTIFIER=console   # terminal (default)
+ARIA_NOTIFIER=slack     # Slack channel
+ARIA_NOTIFIER=email     # SMTP email
 ```
 
-**Slack setup**
-```
-ARIA_SLACK_WEBHOOK_URL=https://hooks.slack.com/services/...
-```
-Create a webhook at: Slack → Your App → Incoming Webhooks → Add New Webhook
+**Slack:** `ARIA_SLACK_WEBHOOK_URL=https://hooks.slack.com/services/...`
 
-**Email setup**
+**Email:**
 ```
 ARIA_SMTP_HOST=smtp.gmail.com
 ARIA_SMTP_PORT=465
@@ -229,53 +245,30 @@ ARIA_EMAIL_SENDER=you@gmail.com
 ARIA_EMAIL_PASSWORD=your-app-password
 ARIA_EMAIL_RECIPIENT=oncall@yourteam.com
 ```
-For Gmail: use an [App Password](https://myaccount.google.com/apppasswords), not your regular password.
 
----
+### Anomaly Rules
 
-### Adding anomaly rules
-
-Edit `aria/config.yaml`. Each rule is a PromQL query that returns results **only when a threshold is breached**:
+Each rule is a PromQL expression that returns results **only when a threshold is breached**:
 
 ```yaml
 prometheus:
   anomaly_rules:
-    - name: "High CPU"
-      query: '100 - (avg(rate(node_cpu_seconds_total{mode="idle"}[5m])) * 100) > 80'
+    - name: "High CPU Usage"
+      query: 'system_cpu_usage > 0.50'
       severity: "warning"
 
     - name: "High JVM Heap"
       query: 'jvm_memory_used_bytes{area="heap"} / jvm_memory_max_bytes{area="heap"} > 0.85'
       severity: "warning"
 
-    - name: "High Error Rate"
+    - name: "HTTP 5xx Error Rate"
       query: 'rate(http_server_requests_seconds_count{status=~"5.."}[5m]) > 0.05'
       severity: "critical"
 ```
 
-**How rules work:**
-- If the query returns **nothing** → all clear
-- If the query returns **a result** → anomaly detected, investigation starts
+No code changes needed — edit the YAML and restart ARIA.
 
-No code changes needed — just edit the YAML and restart ARIA.
-
----
-
-### Disabling components
-
-If your stack doesn't use Kafka or PostgreSQL, disable them in `.env`:
-
-```
-ARIA_KAFKA_ENABLED=false
-```
-
-ARIA will skip those tools during investigation and Claude will work with whatever data is available.
-
----
-
-### Safe container list
-
-ARIA will **only** restart containers explicitly listed here. This is a hard code-level check — Claude cannot bypass it regardless of its reasoning.
+### Safe Container List
 
 ```yaml
 docker:
@@ -285,20 +278,7 @@ docker:
     - "sms-worker"
 ```
 
-Leave this list empty if you don't want ARIA to restart anything autonomously.
-
----
-
-## Running with Docker
-
-Run ARIA alongside your existing stack:
-
-```bash
-cp .env.example .env   # fill in your values
-docker-compose up -d
-```
-
-ARIA connects to your existing services via `network_mode: host`, so it can reach Prometheus, PostgreSQL, and Kafka on their usual ports.
+Leave empty to disable autonomous restarts entirely.
 
 ---
 
@@ -307,25 +287,34 @@ ARIA connects to your existing services via `network_mode: host`, so it can reac
 ```
 aria/
 ├── aria/
-│   ├── main.py              # entry point — polling loop
-│   ├── config.py            # config loading
-│   ├── config.yaml          # anomaly rules + settings
-│   ├── models.py            # data models (Anomaly, Diagnosis)
+│   ├── main.py                  # entry point — polling loop
+│   ├── config.py                # config loading (env + yaml)
+│   ├── config.yaml              # anomaly rules + settings
+│   ├── models.py                # Anomaly, Diagnosis, CorrelatedIncident
+│   ├── correlator.py            # fleet-wide incident grouping
+│   ├── cli.py                   # aria-feedback, aria-stats commands
 │   ├── agent/
-│   │   ├── loop.py          # Claude tool-use reasoning loop
-│   │   ├── tools.py         # tool definitions Claude reads
-│   │   └── system_prompt.py # Claude's instructions
-│   ├── tools/               # tool implementations
-│   │   ├── prometheus.py    # query metrics
-│   │   ├── postgres.py      # query slow queries
-│   │   ├── kafka.py         # check consumer lag
-│   │   └── docker_tool.py   # restart containers
+│   │   ├── loop.py              # Claude tool-use reasoning loop
+│   │   ├── router.py            # adaptive tool selection
+│   │   ├── tools.py             # tool definitions Claude reads
+│   │   └── system_prompt.py     # Claude's instructions + guardrails
+│   ├── tools/
+│   │   ├── base.py              # ToolResult, ToolRegistry
+│   │   ├── prometheus.py        # query metrics
+│   │   ├── postgres.py          # slow query analysis
+│   │   ├── kafka.py             # consumer lag
+│   │   └── docker_tool.py       # container restarts
 │   ├── detectors/
-│   │   └── prometheus.py    # anomaly detection
+│   │   └── prometheus.py        # anomaly detection
+│   ├── memory/
+│   │   ├── store.py             # SQLite CRUD, family upsert, feedback
+│   │   ├── matcher.py           # 4-dimension similarity scoring
+│   │   └── family.py            # trend, risk, name generation logic
 │   └── notifiers/
-│       ├── slack.py         # Slack webhook
-│       ├── email.py         # SMTP email
-│       └── console.py       # terminal output
+│       ├── factory.py           # notifier selection
+│       ├── slack.py
+│       ├── email.py
+│       └── console.py
 ├── .env.example
 ├── docker-compose.yml
 └── pyproject.toml
@@ -335,33 +324,33 @@ aria/
 
 ## Roadmap
 
-| Version | What's planned |
-|---|---|
-| **v1 (current)** | Prometheus + PostgreSQL + Kafka + Docker |
-| **v2** | Pluggable detectors — Datadog, CloudWatch, Zipkin |
-| **v3** | Pluggable databases — MongoDB, Snowflake, MySQL |
-| **v4** | Pluggable queues — RabbitMQ, SQS, no queue |
-| **v5** | Kubernetes support, memory across incidents |
+| Version | Status | What |
+|---|---|---|
+| **v1** | ✅ Done | Prometheus detection, Claude loop, Kafka + PostgreSQL + Docker tools, multi-notifier |
+| **v2** | ✅ Done | Incident Memory, Correlation Engine, Family Tracking, Adaptive Tool Selection, Human Feedback |
+| **v3** | Planned | Multi-agent system — Triage → Investigation → Remediation → Verifier agents |
+| **v4** | Planned | Pluggable detectors — Datadog, CloudWatch, Zipkin |
+| **v5** | Planned | Kubernetes support, RabbitMQ, SQS |
 
 ---
 
 ## Contributing
 
-Contributions are welcome. ARIA is MIT licensed — use it, fork it, improve it.
+MIT licensed — use it, fork it, improve it.
 
 Good places to start:
 - Add a new notifier (Discord, PagerDuty, Microsoft Teams)
 - Add a new anomaly rule for a common failure pattern
 - Add support for a new monitoring tool, database, or message queue
-- Improve the Claude system prompt for better root cause accuracy
+- Extend the router with new signal classes
 
-Please open an issue before starting a large change so we can discuss the approach.
+Please open an issue before starting a large change.
 
 ---
 
 ## License
 
-MIT License — see [LICENSE](LICENSE) for details.
+MIT — see [LICENSE](LICENSE) for details.
 
 ---
 
