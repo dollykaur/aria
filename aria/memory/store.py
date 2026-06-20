@@ -122,7 +122,7 @@ def save_incident(anomalies: list[Anomaly], diagnosis: Diagnosis) -> tuple[str, 
     snapshot_value = max((a.value for a in anomalies), default=0.0)
 
     with _connect() as conn:
-        family_id, family = _upsert_family(conn, anomalies, snapshot_value)
+        family_id, family = _upsert_family(conn, anomalies, snapshot_value, diagnosis.root_cause, affected_services)
 
         conn.execute("""
             INSERT INTO incidents (
@@ -153,7 +153,7 @@ def save_incident(anomalies: list[Anomaly], diagnosis: Diagnosis) -> tuple[str, 
     return incident_id, family
 
 
-def _upsert_family(conn, anomalies: list[Anomaly], snapshot_value: float) -> tuple[str, dict]:
+def _upsert_family(conn, anomalies: list[Anomaly], snapshot_value: float, root_cause: str, affected_services: list[str]) -> tuple[str, dict]:
     """
     Find a matching family and update it, or create a new one.
     Returns (family_id, family_dict_with_computed_fields).
@@ -209,7 +209,7 @@ def _upsert_family(conn, anomalies: list[Anomaly], snapshot_value: float) -> tup
     else:
         # ── Create new family ────────────────────────────────────────────────
         family_id = str(uuid.uuid4())[:8]
-        name = generate_name(anomalies)
+        name = generate_name(anomalies, root_cause, affected_services)
         metric_names = sorted(extract_metric_names(anomalies))
         snapshots = [{"detected_at": now, "value": snapshot_value}]
 
