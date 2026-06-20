@@ -1,5 +1,7 @@
+import re
 import json
 import logging
+from datetime import datetime
 from aria.models import Anomaly
 from aria.memory.store import get_recent_incidents
 
@@ -9,49 +11,112 @@ logger = logging.getLogger(__name__)
 # deep investigation. Below it Claude gets hints but must still investigate.
 HIGH_SIMILARITY_THRESHOLD = 0.85
 
+# ── Scoring weights — must sum to 1.0 ────────────────────────────────────────
+_W_ANOMALY_TYPE = 0.40   # what kind of alert fired
+_W_SERVICES     = 0.25   # which services were affected
+_W_METRICS      = 0.20   # which raw Prometheus metrics appeared in the queries
+_W_TIME_OF_DAY  = 0.15   # same hour-of-day (catches scheduled-job patterns)
+
+_PROMQL_KEYWORDS = {
+    "rate", "increase", "irate", "delta", "sum", "avg", "max", "min",
+    "count", "by", "without", "on", "group_left", "group_right",
+    "histogram_quantile", "label_replace", "offset", "bool", "or",
+    "and", "unless", "ignoring", "with",
+}
+
+
+def _jaccard(a: set, b: set) -> float:
+    """Intersection over union. Returns 0 when both sets are empty."""
+    union = a | b
+    return len(a & b) / len(union) if union else 0.0
+
+
+def _name_tokens(rule_name: str) -> set[str]:
+    """Split 'High CPU Usage' → {'high', 'cpu', 'usage'} for soft matching."""
+    return set(rule_name.lower().split())
+
+
+def _extract_metrics(query: str) -> set[str]:
+    """Pull raw metric identifiers out of a PromQL expression."""
+    tokens = set(re.findall(r'\b[a-z_][a-z0-9_]*\b', query.lower()))
+    return tokens - _PROMQL_KEYWORDS
+
+
+def _temporal_score(past_iso: str, current_dt: datetime) -> float:
+    """
+    Score based on hour-of-day proximity (UTC).
+    Same hour → 1.0 | ±1 h → 0.5 | ±2 h → 0.25 | further → 0.0
+    """
+    try:
+        past_hour = datetime.fromisoformat(past_iso).hour
+    except ValueError:
+        return 0.0
+    diff = abs(current_dt.hour - past_hour)
+    diff = min(diff, 24 - diff)  # wrap around midnight
+    if diff == 0:
+        return 1.0
+    if diff == 1:
+        return 0.5
+    if diff == 2:
+        return 0.25
+    return 0.0
+
 
 def find_similar_incidents(
-    anomalies: list[Anomaly], threshold: float = 0.5
+    anomalies: list[Anomaly], threshold: float = 0.4
 ) -> list[tuple[float, dict]]:
     """
-    Compare incoming anomalies against past incidents.
-    Returns (score, incident) tuples sorted by score descending.
+    Score past incidents against the incoming anomaly set across four
+    independent dimensions:
 
-    Scoring:
-      +0.5 — same anomaly rule names
-      +0.3 — same affected services
-      +0.2 — incident was resolved successfully
+      40% — anomaly type  (word-token Jaccard on rule names)
+      25% — affected services (set Jaccard)
+      20% — metric signals  (Jaccard on raw PromQL metric identifiers)
+      15% — time-of-day     (hour proximity, catches scheduled-job patterns)
+
+    Each dimension is a proper Jaccard ratio in [0, 1], so no single dimension
+    can manufacture a misleadingly high total score.
     """
     past_incidents = get_recent_incidents(limit=20)
     if not past_incidents:
         return []
 
-    incoming_names = set(a.rule_name for a in anomalies)
-    incoming_services = set(
+    # Pre-compute incoming fingerprint once
+    incoming_name_tokens: set[str] = set()
+    for a in anomalies:
+        incoming_name_tokens |= _name_tokens(a.rule_name)
+
+    incoming_services = {
         a.labels.get("application", a.labels.get("job", "unknown"))
         for a in anomalies
-    )
+    }
+
+    incoming_metrics: set[str] = set()
+    for a in anomalies:
+        incoming_metrics |= _extract_metrics(a.query)
+
+    current_dt = anomalies[0].detected_at
 
     scored = []
     for incident in past_incidents:
-        score = 0.0
-        past_names = set(json.loads(incident["anomaly_names"]))
-        past_services = set(json.loads(incident["affected_services"]))
+        past_name_tokens: set[str] = set()
+        for name in json.loads(incident["anomaly_names"]):
+            past_name_tokens |= _name_tokens(name)
 
-        if incoming_names == past_names:
-            score += 0.5
-        elif incoming_names & past_names:
-            overlap = len(incoming_names & past_names) / len(incoming_names | past_names)
-            score += 0.5 * overlap
+        past_services  = set(json.loads(incident["affected_services"]))
+        past_metrics   = set(json.loads(incident.get("metric_names") or "[]"))
 
-        if incoming_services == past_services:
-            score += 0.3
-        elif incoming_services & past_services:
-            overlap = len(incoming_services & past_services) / len(incoming_services | past_services)
-            score += 0.3 * overlap
+        dim_type    = _jaccard(incoming_name_tokens, past_name_tokens)
+        dim_service = _jaccard(incoming_services, past_services)
+        dim_metric  = _jaccard(incoming_metrics, past_metrics) if past_metrics else 0.0
+        dim_time    = _temporal_score(incident["detected_at"], current_dt)
 
-        if incident["resolved"]:
-            score += 0.2
+        score = (
+            _W_ANOMALY_TYPE * dim_type
+            + _W_SERVICES   * dim_service
+            + _W_METRICS    * dim_metric
+            + _W_TIME_OF_DAY * dim_time
+        )
 
         if score >= threshold:
             scored.append((score, incident))

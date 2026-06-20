@@ -39,6 +39,7 @@ def init_db():
                 -- What happened (stored as JSON lists)
                 anomaly_names TEXT NOT NULL,
                 affected_services TEXT NOT NULL,
+                metric_names TEXT NOT NULL DEFAULT '[]',
 
                 -- What ARIA found
                 root_cause TEXT NOT NULL,
@@ -55,36 +56,55 @@ def init_db():
                 recurrence_count INTEGER DEFAULT 1
             )
         """)
+        # Migrate existing databases that predate the metric_names column
+        try:
+            conn.execute("ALTER TABLE incidents ADD COLUMN metric_names TEXT NOT NULL DEFAULT '[]'")
+        except Exception:
+            pass  # column already exists
         conn.commit()
     logger.info("Incident memory database ready at %s", DB_PATH)
 
 
 def save_incident(anomalies: list[Anomaly], diagnosis: Diagnosis):
     """Save a completed investigation to the database."""
+    import re
     incident_id = str(uuid.uuid4())[:8]  # short readable ID like "a3f9b2c1"
 
-    # Extract unique service names from anomaly labels
     affected_services = list({
         a.labels.get("application", a.labels.get("job", "unknown"))
         for a in anomalies
     })
 
+    # Extract raw metric names from PromQL queries (e.g. "system_cpu_usage",
+    # "jvm_memory_used_bytes") so the similarity engine can compare signals,
+    # not just human-readable rule names.
+    _PROMQL_KEYWORDS = {
+        "rate", "increase", "irate", "delta", "sum", "avg", "max", "min",
+        "count", "by", "without", "on", "group_left", "group_right",
+        "histogram_quantile", "label_replace", "offset", "bool", "or",
+        "and", "unless", "ignoring", "with",
+    }
+    metric_names: set[str] = set()
+    for a in anomalies:
+        tokens = set(re.findall(r'\b[a-z_][a-z0-9_]*\b', a.query.lower()))
+        metric_names |= tokens - _PROMQL_KEYWORDS
+
     with _connect() as conn:
         conn.execute("""
             INSERT INTO incidents (
-                id, detected_at, anomaly_names, affected_services,
+                id, detected_at, anomaly_names, affected_services, metric_names,
                 root_cause, evidence, confidence, action_taken,
                 container_restarted, resolved, investigation_duration_seconds
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
             incident_id,
             anomalies[0].detected_at.isoformat(),
-            # Store lists as JSON strings — SQLite doesn't have array types
             json.dumps([a.rule_name for a in anomalies]),
             json.dumps(affected_services),
+            json.dumps(sorted(metric_names)),
             diagnosis.root_cause,
             json.dumps(diagnosis.recommendations),
-            0.85,  # default confidence — will improve with verifier agent in v3
+            0.85,
             diagnosis.action_taken.action_type,
             diagnosis.action_taken.target,
             1 if diagnosis.action_taken.success else 0,
