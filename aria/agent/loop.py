@@ -8,6 +8,7 @@ from aria.agent.system_prompt import build_system_prompt
 from aria.tools.base import ToolRegistry
 from aria.memory.matcher import find_similar_incidents, build_memory_context
 from aria.memory.store import save_incident, find_matching_family, get_accuracy_stats
+from aria.agent.router import suggest_investigation_path
 
 logger = logging.getLogger(__name__)
 
@@ -52,9 +53,12 @@ def investigate(incident: CorrelatedIncident, config) -> Diagnosis:
         if int(top_score * 100) >= 85:
             print(f"  • KNOWN PATTERN ({int(top_score * 100)}% similarity) — Claude will confirm quickly")
 
+    investigation_path = suggest_investigation_path(anomalies)
+
     initial_message = (
         f"Incident detected at {anomalies[0].detected_at.isoformat()}:\n\n"
         f"{incident_brief}\n\n"
+        f"{investigation_path}"
         f"{family_context}"
         f"{memory_context}"
         "Please investigate, identify the root cause, and take one safe remediation action if appropriate."
