@@ -7,7 +7,7 @@ from aria.agent.tools import TOOL_DEFINITIONS
 from aria.agent.system_prompt import build_system_prompt
 from aria.tools.base import ToolRegistry
 from aria.memory.matcher import find_similar_incidents, build_memory_context
-from aria.memory.store import save_incident, find_matching_family
+from aria.memory.store import save_incident, find_matching_family, get_accuracy_stats
 
 logger = logging.getLogger(__name__)
 
@@ -36,25 +36,21 @@ def investigate(incident: CorrelatedIncident, config) -> Diagnosis:
         f"RAW SIGNALS:\n{signals_text}"
     )
 
-    # Check for existing family BEFORE investigation so Claude knows the history
+    # Check for existing family BEFORE investigation so Claude knows the history.
+    # Pass occurrence_count + 1 so Claude's text agrees with the count after save.
     existing_family = find_matching_family(anomalies)
     family_context = _build_family_context(existing_family)
-    if existing_family:
-        print(
-            f"  • Family: \"{existing_family['name']}\" — "
-            f"{existing_family['occurrence_count']} occurrence(s) | "
-            f"{existing_family['trend'].upper()} | Risk: {existing_family['risk_level'].upper()}"
-        )
 
-    # Check memory for similar past incidents
-    similar = find_similar_incidents(anomalies)  # list of (score, incident) tuples
+    # Memory context goes to Claude only — do not echo the raw count to console
+    # because it would disagree with the family count printed after save.
+    similar = find_similar_incidents(anomalies)
     memory_context = build_memory_context(similar)
 
+    # Only surface the confidence label when it's meaningful
     if similar:
         top_score, _ = similar[0]
-        top_pct = int(top_score * 100)
-        label = "KNOWN PATTERN" if top_pct >= 85 else "partial match"
-        print(f"  • Memory: {len(similar)} similar incident(s) — top similarity {top_pct}% ({label})")
+        if int(top_score * 100) >= 85:
+            print(f"  • KNOWN PATTERN ({int(top_score * 100)}% similarity) — Claude will confirm quickly")
 
     initial_message = (
         f"Incident detected at {anomalies[0].detected_at.isoformat()}:\n\n"
@@ -131,12 +127,16 @@ def investigate(incident: CorrelatedIncident, config) -> Diagnosis:
 
 def _build_family_context(family: dict | None) -> str:
     """
-    Inject incident family history into Claude's prompt so it knows
-    this is a recurrence, how often it happens, and whether it's worsening.
+    Inject incident family history into Claude's prompt.
+
+    We use occurrence_count + 1 so that the number Claude writes in its
+    diagnosis ("this is occurrence #4") matches exactly what gets saved
+    to the database — one source of truth.
     """
-    if not family or family["occurrence_count"] < 2:
+    if not family:
         return ""
 
+    this_occurrence = family["occurrence_count"] + 1
     pct = abs(family.get("metric_pct_change", 0.0))
     trend = family["trend"]
     risk = family["risk_level"].upper()
@@ -144,14 +144,15 @@ def _build_family_context(family: dict | None) -> str:
     last = family["last_seen"][:16].replace("T", " ")
 
     pct_line = ""
-    if pct > 0 and trend != "stable":
+    if pct > 5 and trend != "stable":
         direction = "increase" if trend == "worsening" else "decrease"
         pct_line = f"METRIC TREND      : {pct:.1f}% {direction} since first occurrence\n"
 
     return (
         f"INCIDENT FAMILY   : {family['name']}\n"
-        f"OCCURRENCES       : {family['occurrence_count']} "
-        f"(first seen: {first} | last seen: {last})\n"
+        f"FIRST SEEN        : {first}\n"
+        f"LAST SEEN         : {last}\n"
+        f"OCCURRENCES       : {family['occurrence_count']} previous — this is occurrence #{this_occurrence}\n"
         f"TREND             : {trend.upper()}\n"
         f"{pct_line}"
         f"RISK LEVEL        : {risk}\n\n"
@@ -159,20 +160,30 @@ def _build_family_context(family: dict | None) -> str:
 
 
 def _print_family_summary(incident_id: str, family: dict):
-    n = family["occurrence_count"]
+    n = family["occurrence_count"]  # already incremented by save_incident
     trend = family["trend"].upper()
     risk = family["risk_level"].upper()
     pct = abs(family.get("metric_pct_change", 0.0))
+    pct_str = (
+        f" | {'+' if family.get('metric_pct_change', 0) > 0 else '-'}{pct:.0f}% metric"
+        if pct > 5 else ""
+    )
 
-    print(f"  • Incident saved (ID: {incident_id}) → Family: \"{family['name']}\"")
-    if n == 1:
-        print(f"    New family created — first occurrence")
-    else:
-        pct_str = f" | metric {'+' if family.get('metric_pct_change',0) > 0 else '-'}{pct:.0f}%" if pct > 5 else ""
-        print(f"    Occurrence #{n} | {trend}{pct_str} | Risk: {risk}")
+    print(f"\n  Incident Family : {family['name']}")
+    print(f"  First Seen      : {family['first_seen'][:16].replace('T', ' ')}")
+    print(f"  Last Seen       : {family['last_seen'][:16].replace('T', ' ')}")
+    print(f"  Occurrences     : {n}")
+    print(f"  Trend           : {trend}{pct_str}")
+    print(f"  Risk Level      : {risk}")
+    print(f"  Incident ID     : {incident_id}")
 
-    print(f"  • aria feedback {incident_id} correct")
-    print(f"    aria feedback {incident_id} incorrect \"<actual cause>\"")
+    stats = get_accuracy_stats()
+    if stats["total"] > 0:
+        print(f"\n  Historical Accuracy")
+        print(f"  Validated Diagnoses : {stats['total']}")
+        print(f"  Correct             : {stats['correct']}")
+        print(f"  Incorrect           : {stats['incorrect']}")
+        print(f"  Confidence          : {stats['accuracy_pct']}%")
 
 
 def _describe_tool(name: str, inputs: dict) -> str:
