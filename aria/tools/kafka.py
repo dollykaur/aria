@@ -12,7 +12,8 @@ class KafkaTools:
 
             admin = AdminClient({"bootstrap.servers": self.config.bootstrap_servers})
 
-            groups_result = admin.list_consumer_groups()
+            # list_consumer_groups() returns a Future — call .result() to get groups
+            groups_result = admin.list_consumer_groups().result()
             all_groups = [g.group_id for g in groups_result.valid]
 
             if not all_groups:
@@ -24,29 +25,35 @@ class KafkaTools:
             total_lag = 0
 
             for gid in target_groups:
-                offsets_result = admin.list_consumer_group_offsets([gid])
-                group_offsets = offsets_result[gid].result()
-
-                if not group_offsets:
-                    lines.append(f"  {gid}: no committed offsets")
-                    continue
-
-                # Get high watermarks to compute actual lag
+                # Use a temporary consumer to fetch committed offsets + watermarks
                 consumer = Consumer({
                     "bootstrap.servers": self.config.bootstrap_servers,
-                    "group.id": f"aria-lag-check-{gid}",
+                    "group.id": gid,
+                    "enable.auto.commit": False,
                 })
                 try:
+                    # Get all partitions for this group via assignment metadata
+                    cluster_metadata = consumer.list_topics(timeout=10)
                     group_lag = 0
-                    for tp, offset_meta in group_offsets.items():
-                        low, high = consumer.get_watermark_offsets(
-                            TopicPartition(tp.topic, tp.partition), timeout=5
-                        )
-                        committed = offset_meta.offset if offset_meta.offset >= 0 else low
-                        lag = max(0, high - committed)
-                        group_lag += lag
-                        if lag > 0:
-                            lines.append(f"  {gid} | {tp.topic}[{tp.partition}] lag={lag} committed={committed} high={high}")
+
+                    for topic_name, topic_meta in cluster_metadata.topics.items():
+                        if topic_name.startswith("__"):
+                            continue  # skip internal Kafka topics
+
+                        for partition_id in topic_meta.partitions:
+                            tp = TopicPartition(topic_name, partition_id)
+                            committed = consumer.committed([tp], timeout=5)
+                            low, high = consumer.get_watermark_offsets(tp, timeout=5)
+
+                            if committed and committed[0].offset >= 0:
+                                lag = max(0, high - committed[0].offset)
+                                group_lag += lag
+                                if lag > 0:
+                                    lines.append(
+                                        f"  {gid} | {topic_name}[{partition_id}] "
+                                        f"lag={lag} committed={committed[0].offset} high={high}"
+                                    )
+
                     total_lag += group_lag
                     if group_lag == 0:
                         lines.append(f"  {gid}: no lag (all caught up)")
@@ -55,7 +62,7 @@ class KafkaTools:
 
             summary = f"Total consumer lag across {len(target_groups)} group(s): {total_lag}"
             if total_lag > self.config.consumer_lag_threshold:
-                summary += f" ⚠️ ABOVE THRESHOLD ({self.config.consumer_lag_threshold})"
+                summary += f" WARNING: above threshold ({self.config.consumer_lag_threshold})"
 
             return ToolResult(summary + "\n" + "\n".join(lines))
 

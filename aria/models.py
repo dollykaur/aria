@@ -24,6 +24,13 @@ class ActionTaken(BaseModel):
     detail: str
 
 
+class CorrelatedIncident(BaseModel):
+    title: str               # "Fleet-wide High CPU Usage" or just the rule name
+    severity: Severity       # highest severity across the group
+    anomalies: list[Anomaly]
+    affected_services: list[str]  # service names extracted from Prometheus labels
+
+
 class Diagnosis(BaseModel):
     anomalies: list[Anomaly]
     root_cause: str
