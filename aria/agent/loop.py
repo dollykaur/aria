@@ -7,7 +7,7 @@ from aria.agent.tools import TOOL_DEFINITIONS
 from aria.agent.system_prompt import build_system_prompt
 from aria.tools.base import ToolRegistry
 from aria.memory.matcher import find_similar_incidents, build_memory_context
-from aria.memory.store import save_incident
+from aria.memory.store import save_incident, find_matching_family
 
 logger = logging.getLogger(__name__)
 
@@ -36,6 +36,16 @@ def investigate(incident: CorrelatedIncident, config) -> Diagnosis:
         f"RAW SIGNALS:\n{signals_text}"
     )
 
+    # Check for existing family BEFORE investigation so Claude knows the history
+    existing_family = find_matching_family(anomalies)
+    family_context = _build_family_context(existing_family)
+    if existing_family:
+        print(
+            f"  • Family: \"{existing_family['name']}\" — "
+            f"{existing_family['occurrence_count']} occurrence(s) | "
+            f"{existing_family['trend'].upper()} | Risk: {existing_family['risk_level'].upper()}"
+        )
+
     # Check memory for similar past incidents
     similar = find_similar_incidents(anomalies)  # list of (score, incident) tuples
     memory_context = build_memory_context(similar)
@@ -49,6 +59,7 @@ def investigate(incident: CorrelatedIncident, config) -> Diagnosis:
     initial_message = (
         f"Incident detected at {anomalies[0].detected_at.isoformat()}:\n\n"
         f"{incident_brief}\n\n"
+        f"{family_context}"
         f"{memory_context}"
         "Please investigate, identify the root cause, and take one safe remediation action if appropriate."
     )
@@ -111,11 +122,57 @@ def investigate(incident: CorrelatedIncident, config) -> Diagnosis:
     duration = time.monotonic() - start
     diagnosis = _parse_diagnosis(anomalies, final_text, action_taken, duration)
 
-    # Save to memory so future investigations can learn from this one
-    incident_id = save_incident(anomalies, diagnosis)
-    print(f"  • Incident saved to memory (ID: {incident_id})")
+    # Save to memory — also upserts the incident family
+    incident_id, family = save_incident(anomalies, diagnosis)
+    _print_family_summary(incident_id, family)
 
     return diagnosis
+
+
+def _build_family_context(family: dict | None) -> str:
+    """
+    Inject incident family history into Claude's prompt so it knows
+    this is a recurrence, how often it happens, and whether it's worsening.
+    """
+    if not family or family["occurrence_count"] < 2:
+        return ""
+
+    pct = abs(family.get("metric_pct_change", 0.0))
+    trend = family["trend"]
+    risk = family["risk_level"].upper()
+    first = family["first_seen"][:16].replace("T", " ")
+    last = family["last_seen"][:16].replace("T", " ")
+
+    pct_line = ""
+    if pct > 0 and trend != "stable":
+        direction = "increase" if trend == "worsening" else "decrease"
+        pct_line = f"METRIC TREND      : {pct:.1f}% {direction} since first occurrence\n"
+
+    return (
+        f"INCIDENT FAMILY   : {family['name']}\n"
+        f"OCCURRENCES       : {family['occurrence_count']} "
+        f"(first seen: {first} | last seen: {last})\n"
+        f"TREND             : {trend.upper()}\n"
+        f"{pct_line}"
+        f"RISK LEVEL        : {risk}\n\n"
+    )
+
+
+def _print_family_summary(incident_id: str, family: dict):
+    n = family["occurrence_count"]
+    trend = family["trend"].upper()
+    risk = family["risk_level"].upper()
+    pct = abs(family.get("metric_pct_change", 0.0))
+
+    print(f"  • Incident saved (ID: {incident_id}) → Family: \"{family['name']}\"")
+    if n == 1:
+        print(f"    New family created — first occurrence")
+    else:
+        pct_str = f" | metric {'+' if family.get('metric_pct_change',0) > 0 else '-'}{pct:.0f}%" if pct > 5 else ""
+        print(f"    Occurrence #{n} | {trend}{pct_str} | Risk: {risk}")
+
+    print(f"  • aria feedback {incident_id} correct")
+    print(f"    aria feedback {incident_id} incorrect \"<actual cause>\"")
 
 
 def _describe_tool(name: str, inputs: dict) -> str:

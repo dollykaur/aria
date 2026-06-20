@@ -18,6 +18,8 @@ dependencies = [
 
 [project.scripts]
 aria = "aria.main:main"
+aria-feedback = "aria.cli:feedback_main"
+aria-stats = "aria.cli:stats_main"
 
 [build-system]
 requires = ["hatchling"]
